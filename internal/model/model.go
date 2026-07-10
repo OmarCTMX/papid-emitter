@@ -11,24 +11,6 @@ const (
 // TotalSlots es la cantidad fija de espacios por máquina.
 const TotalSlots = 3
 
-// Trabajador representa a una persona en un espacio.
-type Trabajador struct {
-	ID               string
-	Nombre           string
-	Rol              string
-	Estado           string
-	EmployeeID       string
-	TipoAsignacionID int
-	YaRegistrado     bool
-	FechaHoraInicioReal string
-	UsbPort          string
-}
-
-// Vacante devuelve un espacio vacío.
-func Vacante() Trabajador {
-	return Trabajador{ID: "", Nombre: "No asignado", Rol: "—", Estado: EstadoEmpty}
-}
-
 // EventoRFID es el mensaje de login/logout del lector.
 type EventoRFID struct {
 	Tag     string `json:"tag"`
@@ -65,6 +47,9 @@ type PersonaAsignada struct {
 type MensajeSync struct {
 	MachineCode string        `json:"machine_code"`
 	Personnel   []PersonaSync `json:"personnel"`
+	// DefMaquinas: si está presente (modo DEF_MAQUINAS), los dashboards deben
+	// filtrar por code EXACTO contra esta lista en vez de por prefijo.
+	DefMaquinas []string `json:"def_maquinas,omitempty"`
 }
 
 // MensajeFull es lo que publicamos en papid.personalui.full.
@@ -79,11 +64,12 @@ type MensajeFull struct {
 
 // PersonaSync es cada elemento del "personnel" que publicamos.
 type PersonaSync struct {
-	EmployeeID          string `json:"employee_id"`
-	Nombre              string `json:"nombre,omitempty"`
-	Rol                 string `json:"rol,omitempty"`
-	FechaHoraInicioReal string `json:"fecha_hora_inicio_real,omitempty"`
-	Status              string `json:"status"`
-	TipoAsignacionID    int    `json:"tipo_asignacion_id"`
-	UsbPort             string `json:"usb_port,omitempty"`
+	EmployeeID          string   `json:"employee_id"`
+	Nombre              string   `json:"nombre,omitempty"`
+	Rol                 string   `json:"rol,omitempty"`
+	FechaHoraInicioReal string   `json:"fecha_hora_inicio_real,omitempty"`
+	Status              string   `json:"status"`
+	TipoAsignacionID    int      `json:"tipo_asignacion_id"`
+	UsbPort             string   `json:"usb_port,omitempty"`
+	Maquinas            []string `json:"maquinas,omitempty"` // sub-máquinas donde está asignado (solo en papid.emitter.sync)
 }

@@ -1,17 +1,23 @@
-// Package multistore mantiene el estado del personal de MÚLTIPLES máquinas.
-// Un solo emitter puede procesar todas las máquinas y publicar al subject
-// correcto de cada una (papid.emitter.<machine_code>).
+// Package multistore mantiene el estado ÚNICO del personal de una máquina
+// física (la del emitter). Una persona aparece UNA sola vez, con un solo
+// estado (verde/naranja), pero puede pertenecer a varias sub-máquinas
+// (ej. a2i-1-r, a2i-2-r). El campo Maquinas guarda ese conjunto.
+//
+// Los mensajes de asignación (signed/unsigned) llegan por sub-máquina y se
+// FUSIONAN aquí: no se sobreescriben. Así se puede saber en qué sub-máquinas
+// está asignada cada persona.
 package multistore
 
 import (
 	"log"
+	"sort"
 	"sync"
 	"time"
 
 	"papid-emitter/internal/model"
 )
 
-// Trabajador es el estado de una persona en una máquina.
+// Trabajador es el estado de una persona en la máquina.
 type Trabajador struct {
 	ID                  string
 	Nombre              string
@@ -22,251 +28,208 @@ type Trabajador struct {
 	YaRegistrado        bool
 	FechaHoraInicioReal string
 	UsbPort             string
+	Maquinas            map[string]bool // sub-máquinas donde está asignado
 }
 
-// Maquina es el estado de una máquina con su personal.
-type Maquina struct {
-	MachineCode  string
-	MachineID    string
-	IsFrozen     bool
-	OrderDetails model.OrderDetails
-	Personal     [model.TotalSlots]Trabajador
+// Store guarda el estado único del personal de la máquina del emitter.
+type Store struct {
+	mu           sync.RWMutex
+	machineCode  string // máquina física (ej. a2i)
+	machineID    string
+	isFrozen     bool
+	orderDetails model.OrderDetails
+	personal     [model.TotalSlots]Trabajador
+	onChange     func()
 }
 
-// MultiStore guarda el estado de todas las máquinas.
-type MultiStore struct {
-	mu       sync.RWMutex
-	maquinas map[string]*Maquina // clave: machine_code
-
-	// Se llama cada vez que cambia una máquina, pasando su machine_code.
-	onChange func(machineCode string)
+// New crea un store con los espacios vacíos.
+func New(machineCode string) *Store {
+	s := &Store{machineCode: machineCode}
+	for i := range s.personal {
+		s.personal[i] = vacante()
+	}
+	return s
 }
 
-func New() *MultiStore {
-	return &MultiStore{maquinas: make(map[string]*Maquina)}
-}
+func (s *Store) SetOnChange(fn func()) { s.onChange = fn }
 
-func (ms *MultiStore) SetOnChange(fn func(machineCode string)) {
-	ms.onChange = fn
-}
-
-func (ms *MultiStore) notificar(machineCode string) {
-	if ms.onChange != nil {
-		ms.onChange(machineCode)
+func (s *Store) notificar() {
+	if s.onChange != nil {
+		s.onChange()
 	}
 }
 
-// getMaquina devuelve la máquina o la crea si no existe. Debe llamarse con lock.
-func (ms *MultiStore) getMaquina(code string) *Maquina {
-	mq, ok := ms.maquinas[code]
-	if !ok {
-		mq = &Maquina{MachineCode: code}
-		for i := range mq.Personal {
-			mq.Personal[i] = vacante()
-		}
-		ms.maquinas[code] = mq
-	}
-	return mq
+// Asignar fusiona el personal de la sub-máquina subCode en el estado único.
+func (s *Store) Asignar(subCode string, msg model.MensajeAsignacion) {
+	s.aplicarAsignacion(subCode, msg, false)
 }
 
-// Asignar actualiza el personal de una máquina.
-func (ms *MultiStore) Asignar(msg model.MensajeAsignacion) {
-	ms.mu.Lock()
-	mq := ms.getMaquina(msg.MachineCode)
-	mq.MachineID = msg.MachineID
-	mq.IsFrozen = msg.IsFrozen
-	mq.OrderDetails = msg.OrderDetails
-
-	for i := 0; i < model.TotalSlots; i++ {
-		if i < len(msg.Personnel) {
-			p := msg.Personnel[i]
-			estado := model.EstadoPending
-			yaReg := false
-			usbPort := ""
-			// Conservar estado previo si la persona ya estaba.
-			prev := mq.Personal[i]
-			if prev.ID == p.NfcTag {
-				if prev.Estado == model.EstadoActive {
-					estado = model.EstadoActive
-				}
-				yaReg = prev.YaRegistrado
-				usbPort = prev.UsbPort
-			} else {
-				for _, existing := range mq.Personal {
-					if existing.ID == p.NfcTag {
-						if existing.Estado == model.EstadoActive {
-							estado = model.EstadoActive
-						}
-						yaReg = existing.YaRegistrado
-						usbPort = existing.UsbPort
-						break
-					}
-				}
-			}
-			mq.Personal[i] = Trabajador{
-				ID: p.NfcTag, Nombre: p.Name, Rol: valorODefault(p.TipoAsignacion, "—"),
-				Estado: estado, EmployeeID: p.EmployeeID,
-				TipoAsignacionID: p.TipoAsignacionID, YaRegistrado: yaReg, UsbPort: usbPort,
-			}
-		} else {
-			mq.Personal[i] = vacante()
-		}
-	}
-	ms.mu.Unlock()
-	log.Printf("[emitter] Asignación actualizada para %s", msg.MachineCode)
-	ms.notificar(msg.MachineCode)
+// AsignarForzado hace lo mismo pero pone en verde a los entrantes.
+func (s *Store) AsignarForzado(subCode string, msg model.MensajeAsignacion) {
+	s.aplicarAsignacion(subCode, msg, true)
 }
 
-// AsignarForzado pone a todos en verde.
-func (ms *MultiStore) AsignarForzado(msg model.MensajeAsignacion) {
-	ms.mu.Lock()
-	mq := ms.getMaquina(msg.MachineCode)
-	mq.MachineID = msg.MachineID
-	mq.IsFrozen = msg.IsFrozen
-	mq.OrderDetails = msg.OrderDetails
+func (s *Store) aplicarAsignacion(subCode string, msg model.MensajeAsignacion, forzar bool) {
+	s.mu.Lock()
+	s.machineID = msg.MachineID
+	s.isFrozen = msg.IsFrozen
+	s.orderDetails = msg.OrderDetails
 
-	for i := 0; i < model.TotalSlots; i++ {
-		if i < len(msg.Personnel) {
-			p := msg.Personnel[i]
-			mq.Personal[i] = Trabajador{
-				ID: p.NfcTag, Nombre: p.Name, Rol: valorODefault(p.TipoAsignacion, "—"),
-				Estado: model.EstadoActive, EmployeeID: p.EmployeeID,
-				TipoAsignacionID: p.TipoAsignacionID, YaRegistrado: true,
-			}
-		} else {
-			mq.Personal[i] = vacante()
-		}
-	}
-	ms.mu.Unlock()
-	log.Printf("[emitter] Asignación FORZADA para %s", msg.MachineCode)
-	ms.notificar(msg.MachineCode)
-}
-
-// Desasignar vacía una máquina.
-func (ms *MultiStore) Desasignar(machineCode string) {
-	ms.mu.Lock()
-	if mq, ok := ms.maquinas[machineCode]; ok {
-		for i := range mq.Personal {
-			mq.Personal[i] = vacante()
-		}
-	}
-	ms.mu.Unlock()
-	log.Printf("[emitter] Desasignado: %s", machineCode)
-	ms.notificar(machineCode)
-}
-
-// RegistrarPorID busca el tag en TODAS las máquinas y pone en verde.
-// Devuelve (machine_code afectada, esValido, usbPort del evento).
-func (ms *MultiStore) RegistrarPorID(tag string, usbPort string) (string, bool) {
-	ms.mu.Lock()
-	var afectada string
-	for code, mq := range ms.maquinas {
-		for i := range mq.Personal {
-			if mq.Personal[i].ID == tag && mq.Personal[i].Estado == model.EstadoPending {
-				mq.Personal[i].Estado = model.EstadoActive
-				mq.Personal[i].YaRegistrado = true
-				mq.Personal[i].UsbPort = usbPort
-				if mq.Personal[i].FechaHoraInicioReal == "" {
-					mq.Personal[i].FechaHoraInicioReal = time.Now().Format(time.RFC3339)
-				}
-				afectada = code
-				log.Printf("[emitter] Registrado: %s en %s", mq.Personal[i].Nombre, code)
-				break
-			}
-		}
-		if afectada != "" {
-			break
-		}
-	}
-	ms.mu.Unlock()
-
-	if afectada != "" {
-		ms.notificar(afectada)
-		return afectada, true
+	// employee_ids que vienen en este signed de subCode.
+	entrantes := make(map[string]bool)
+	for _, p := range msg.Personnel {
+		entrantes[p.EmployeeID] = true
 	}
 
-	// Verificar si ya estaba activo (no es error).
-	ms.mu.RLock()
-	for _, mq := range ms.maquinas {
-		for _, t := range mq.Personal {
-			if t.ID == tag && t.Estado == model.EstadoActive {
-				ms.mu.RUnlock()
-				return "", true // ya activo, válido pero sin cambio
-			}
-		}
-	}
-	ms.mu.RUnlock()
-	return "", false // no encontrado en ninguna máquina
-}
-
-// RetirarPorID busca el tag y vuelve a pending.
-func (ms *MultiStore) RetirarPorID(tag string) (string, bool) {
-	ms.mu.Lock()
-	var afectada string
-	for code, mq := range ms.maquinas {
-		for i := range mq.Personal {
-			if mq.Personal[i].ID == tag && mq.Personal[i].Estado == model.EstadoActive {
-				mq.Personal[i].Estado = model.EstadoPending
-				afectada = code
-				log.Printf("[emitter] Tarjeta retirada: %s en %s", mq.Personal[i].Nombre, code)
-				break
-			}
-		}
-		if afectada != "" {
-			break
-		}
-	}
-	ms.mu.Unlock()
-
-	if afectada != "" {
-		ms.notificar(afectada)
-		return afectada, true
-	}
-	return "", false
-}
-
-// BuildSync arma el mensaje sync para una máquina específica.
-func (ms *MultiStore) BuildSync(machineCode string) model.MensajeSync {
-	ms.mu.RLock()
-	defer ms.mu.RUnlock()
-
-	mq, ok := ms.maquinas[machineCode]
-	if !ok {
-		return model.MensajeSync{MachineCode: machineCode}
-	}
-
-	personnel := make([]model.PersonaSync, 0, model.TotalSlots)
-	for _, t := range mq.Personal {
+	// 1. Quitar subCode a quienes ya NO vienen en este signed de subCode.
+	//    Si a alguien no le queda ninguna máquina, se vacía su espacio.
+	for i := range s.personal {
+		t := &s.personal[i]
 		if t.Estado == model.EstadoEmpty {
 			continue
 		}
-		personnel = append(personnel, model.PersonaSync{
-			EmployeeID:          t.EmployeeID,
-			Nombre:              t.Nombre,
-			Rol:                 t.Rol,
-			FechaHoraInicioReal: t.FechaHoraInicioReal,
-			Status:              statusDe(t),
-			TipoAsignacionID:    t.TipoAsignacionID,
-			UsbPort:             t.UsbPort,
-		})
+		if t.Maquinas[subCode] && !entrantes[t.EmployeeID] {
+			delete(t.Maquinas, subCode)
+			if len(t.Maquinas) == 0 {
+				s.personal[i] = vacante()
+			}
+		}
 	}
-	return model.MensajeSync{MachineCode: machineCode, Personnel: personnel}
+
+	// 2. Agregar / actualizar los entrantes.
+	for _, p := range msg.Personnel {
+		idx := s.buscarPorEmployee(p.EmployeeID)
+		if idx == -1 {
+			idx = s.slotLibre()
+			if idx == -1 {
+				log.Printf("[emitter] Sin slot libre para %s (máquina llena)", p.Name)
+				continue
+			}
+			s.personal[idx] = Trabajador{
+				Estado:   model.EstadoPending,
+				Maquinas: map[string]bool{},
+			}
+		}
+		t := &s.personal[idx]
+		if t.Maquinas == nil {
+			t.Maquinas = map[string]bool{}
+		}
+		t.Maquinas[subCode] = true
+		// Datos base (se refrescan siempre).
+		t.ID = p.NfcTag
+		t.Nombre = p.Name
+		t.Rol = valorODefault(p.TipoAsignacion, "—")
+		t.EmployeeID = p.EmployeeID
+		t.TipoAsignacionID = p.TipoAsignacionID
+		if forzar {
+			t.Estado = model.EstadoActive
+			t.YaRegistrado = true
+		}
+	}
+	s.mu.Unlock()
+	log.Printf("[emitter] Asignación fusionada (sub-máquina %s)", subCode)
+	s.notificar()
 }
 
-// BuildFull arma el mensaje full para una máquina específica.
-func (ms *MultiStore) BuildFull(machineCode string) model.MensajeFull {
-	ms.mu.RLock()
-	defer ms.mu.RUnlock()
-
-	mq, ok := ms.maquinas[machineCode]
-	if !ok {
-		return model.MensajeFull{MachineCode: machineCode}
+// Desasignar quita la sub-máquina subCode de todos. Quien quede sin máquinas
+// se vacía.
+func (s *Store) Desasignar(subCode string) {
+	s.mu.Lock()
+	for i := range s.personal {
+		t := &s.personal[i]
+		if t.Estado == model.EstadoEmpty {
+			continue
+		}
+		if t.Maquinas[subCode] {
+			delete(t.Maquinas, subCode)
+			if len(t.Maquinas) == 0 {
+				s.personal[i] = vacante()
+			}
+		}
 	}
+	s.mu.Unlock()
+	log.Printf("[emitter] Desasignada sub-máquina %s", subCode)
+	s.notificar()
+}
+
+// RegistrarPorID pone en verde (active) al trabajador con ese tag.
+// Devuelve true si es válido (se registró o ya estaba activo).
+func (s *Store) RegistrarPorID(tag, usbPort string) bool {
+	s.mu.Lock()
+	cambiado := false
+	yaActivo := false
+	for i := range s.personal {
+		t := &s.personal[i]
+		if t.ID != tag {
+			continue
+		}
+		if t.Estado == model.EstadoPending {
+			t.Estado = model.EstadoActive
+			t.YaRegistrado = true
+			t.UsbPort = usbPort
+			if t.FechaHoraInicioReal == "" {
+				t.FechaHoraInicioReal = time.Now().Format(time.RFC3339)
+			}
+			cambiado = true
+			log.Printf("[emitter] Registrado: %s", t.Nombre)
+			break
+		}
+		if t.Estado == model.EstadoActive {
+			yaActivo = true
+		}
+	}
+	s.mu.Unlock()
+
+	if cambiado {
+		s.notificar()
+		return true
+	}
+	return yaActivo
+}
+
+// RetirarPorID regresa a pending (naranja) al trabajador activo con ese tag.
+func (s *Store) RetirarPorID(tag string) bool {
+	s.mu.Lock()
+	cambiado := false
+	for i := range s.personal {
+		t := &s.personal[i]
+		if t.ID == tag && t.Estado == model.EstadoActive {
+			t.Estado = model.EstadoPending
+			cambiado = true
+			log.Printf("[emitter] Tarjeta retirada: %s", t.Nombre)
+			break
+		}
+	}
+	s.mu.Unlock()
+
+	if cambiado {
+		s.notificar()
+	}
+	return cambiado
+}
+
+// BuildSync arma el sync clásico (sin el campo maquinas).
+func (s *Store) BuildSync() model.MensajeSync {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return model.MensajeSync{MachineCode: s.machineCode, Personnel: s.personnel(false)}
+}
+
+// BuildEmitterSync arma el sync para papid.emitter.sync (con maquinas).
+func (s *Store) BuildEmitterSync() model.MensajeSync {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return model.MensajeSync{MachineCode: s.machineCode, Personnel: s.personnel(true)}
+}
+
+// BuildFull arma el mensaje completo (papid.personalui.full).
+func (s *Store) BuildFull() model.MensajeFull {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	hayAsignados := false
 	todosYaReg := true
-	personnel := make([]model.PersonaSync, 0, model.TotalSlots)
-	for _, t := range mq.Personal {
+	for _, t := range s.personal {
 		if t.Estado == model.EstadoEmpty {
 			continue
 		}
@@ -274,7 +237,26 @@ func (ms *MultiStore) BuildFull(machineCode string) model.MensajeFull {
 		if !t.YaRegistrado {
 			todosYaReg = false
 		}
-		personnel = append(personnel, model.PersonaSync{
+	}
+	return model.MensajeFull{
+		IsActive:     hayAsignados && todosYaReg,
+		IsFrozen:     s.isFrozen,
+		MachineCode:  s.machineCode,
+		MachineID:    s.machineID,
+		OrderDetails: s.orderDetails,
+		Personnel:    s.personnel(false),
+	}
+}
+
+// personnel construye la lista de personal (omitiendo los espacios vacíos).
+// Debe llamarse con el lock tomado.
+func (s *Store) personnel(conMaquinas bool) []model.PersonaSync {
+	out := make([]model.PersonaSync, 0, model.TotalSlots)
+	for _, t := range s.personal {
+		if t.Estado == model.EstadoEmpty {
+			continue
+		}
+		p := model.PersonaSync{
 			EmployeeID:          t.EmployeeID,
 			Nombre:              t.Nombre,
 			Rol:                 t.Rol,
@@ -282,17 +264,31 @@ func (ms *MultiStore) BuildFull(machineCode string) model.MensajeFull {
 			Status:              statusDe(t),
 			TipoAsignacionID:    t.TipoAsignacionID,
 			UsbPort:             t.UsbPort,
-		})
+		}
+		if conMaquinas {
+			p.Maquinas = maquinasOrdenadas(t.Maquinas)
+		}
+		out = append(out, p)
 	}
+	return out
+}
 
-	return model.MensajeFull{
-		IsActive:     hayAsignados && todosYaReg,
-		IsFrozen:     mq.IsFrozen,
-		MachineCode:  mq.MachineCode,
-		MachineID:    mq.MachineID,
-		OrderDetails: mq.OrderDetails,
-		Personnel:    personnel,
+func (s *Store) buscarPorEmployee(empID string) int {
+	for i := range s.personal {
+		if s.personal[i].Estado != model.EstadoEmpty && s.personal[i].EmployeeID == empID {
+			return i
+		}
 	}
+	return -1
+}
+
+func (s *Store) slotLibre() int {
+	for i := range s.personal {
+		if s.personal[i].Estado == model.EstadoEmpty {
+			return i
+		}
+	}
+	return -1
 }
 
 func statusDe(t Trabajador) string {
@@ -304,6 +300,15 @@ func statusDe(t Trabajador) string {
 	default:
 		return "Asignado"
 	}
+}
+
+func maquinasOrdenadas(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func vacante() Trabajador {

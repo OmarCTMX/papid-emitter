@@ -17,6 +17,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -38,7 +40,9 @@ const (
 	subjForced    = "papid.admin.signed.forced"
 
 	// Salida
-	topicEmitterPrefix = "papid.emitter." // + machine_code
+	topicEmitterPrefix = "papid.emitter." // + machine_code (por sub-máquina, para el compañero)
+	topicEmitterSync   = "papid.emitter.sync"      // unión + campo maquinas (para el compañero)
+	topicDashboard     = "papid.emitter.dashboard" // unión + maquinas, topic global que leen TODOS los dashboards
 	topicFull          = "papid.personalui.full"
 	topicSync          = "papid.personalui.sync"
 	topicDenied        = "papid.personal.denied"
@@ -46,95 +50,186 @@ const (
 )
 
 func main() {
-	if err := godotenv.Load(); err != nil {
+	if err := godotenv.Overload(); err != nil {
 		log.Println("[emitter] No se encontró .env, se usan variables del entorno")
+	}
+
+	// MACHINE_CODE: el código de ESTA máquina física (lo que publica en
+	//               papid.emitter.dashboard como machine_code).
+	// DEF_MAQUINAS (opcional): lista EXACTA de sub-máquinas. Si se define, solo
+	//               se aceptan esos codes y el mismo mensaje se publica solo a
+	//               esos. Si NO se define, se acepta por PREFIJO: el propio
+	//               MACHINE_CODE y cualquier "MACHINE_CODE-*".
+	//
+	// Ejemplos .env:
+	//   MACHINE_CODE=a2i                       -> acepta a2i, a2i-1-r, a2i-2-r, ...
+	//   MACHINE_CODE=a2i  DEF_MAQUINAS=a2i-1-r,a2i-2-r -> solo esas dos
+	//   MACHINE_CODE=a2i  DEF_MAQUINAS=a2i-1-r         -> máquina individual
+	machineCode := os.Getenv("MACHINE_CODE")
+	defMaquinas := leerDefMaquinas()
+
+	log.Printf("[emitter] MACHINE_CODE: %s", machineCode)
+	if len(defMaquinas) > 0 {
+		log.Printf("[emitter] DEF_MAQUINAS (lista exacta): %v", defMaquinas)
+	} else {
+		log.Printf("[emitter] Modo prefijo: acepta %q y %q-*", machineCode, machineCode)
+	}
+
+	// pertenece decide si un machine_code entrante es de esta máquina.
+	pertenece := func(code string) bool {
+		if len(defMaquinas) > 0 {
+			for _, c := range defMaquinas {
+				if c == code {
+					return true
+				}
+			}
+			return false
+		}
+		// Modo prefijo: el propio code o cualquier sub-máquina "machineCode-...".
+		return code == machineCode || strings.HasPrefix(code, machineCode+"-")
+	}
+
+	// Sedes vistas: sub-máquinas de las que hemos recibido asignaciones.
+	// Se usan para el fan-out por sub-máquina cuando no hay GRUPO explícito.
+	var sedesMu sync.Mutex
+	sedesVistas := make(map[string]bool)
+	recordarSede := func(code string) {
+		sedesMu.Lock()
+		sedesVistas[code] = true
+		sedesMu.Unlock()
+	}
+	// destinosFanout devuelve los codes a los que se publica papid.emitter.<code>.
+	destinosFanout := func() []string {
+		if len(defMaquinas) > 0 {
+			return defMaquinas
+		}
+		sedesMu.Lock()
+		defer sedesMu.Unlock()
+		out := make([]string, 0, len(sedesVistas))
+		for c := range sedesVistas {
+			out = append(out, c)
+		}
+		sort.Strings(out)
+		return out
 	}
 
 	// Conexión a NATS.
 	nc := conectar()
 	defer nc.Drain()
 
-	// Store multi-máquina.
-	ms := multistore.New()
+	// Store de la máquina física (una sola, la del emitter).
+	ms := multistore.New(machineCode)
 
-	// Evita publicar múltiples veces en ráfaga cuando llegan varios eventos
-	// de la misma máquina
+	// Evita publicar múltiples veces en ráfaga cuando llegan varios eventos.
 	const debounceDelay = 200 * time.Millisecond //AQUI ESTA EL DELAY, pueden ser Millisecond o Second
 	var debounceMu sync.Mutex
-	debounceTimers := make(map[string]*time.Timer)
+	var debounceTimer *time.Timer
 
-	publicarParaMaquina := func(machineCode string) {
-		sync := ms.BuildSync(machineCode)
-		data, _ := json.Marshal(sync)
-		subject := topicEmitterPrefix + machineCode
-		nc.Publish(subject, data)
-		log.Printf("[emitter] Publicado en %s", subject)
+	publicar := func() {
+		// Unión del personal (sin el campo maquinas).
+		base := ms.BuildSync()
 
-		nc.Publish(topicSync, data)
-		fullData, _ := json.Marshal(ms.BuildFull(machineCode))
+		// papid.emitter.<sub-máquina> para cada sede conocida (compañero).
+		// Cada mensaje lleva su propio machine_code, con el mismo personal.
+		sedes := destinosFanout()
+		for _, gc := range sedes {
+			base.MachineCode = gc
+			data, _ := json.Marshal(base)
+			nc.Publish(topicEmitterPrefix+gc, data)
+		}
+
+		// papid.personalui.sync / full (node-red) con machine_code = MACHINE_CODE.
+		base.MachineCode = machineCode
+		syncData, _ := json.Marshal(base)
+		nc.Publish(topicSync, syncData)
+		fullData, _ := json.Marshal(ms.BuildFull())
 		nc.Publish(topicFull, fullData)
+
+		// papid.emitter.sync (compañero): objeto único con unión + maquinas.
+		esync := ms.BuildEmitterSync()
+		emitterSyncData, _ := json.Marshal(esync)
+		nc.Publish(topicEmitterSync, emitterSyncData)
+
+		// papid.emitter.dashboard (dashboards): mismo objeto con machine_code =
+		// MACHINE_CODE. Si hay DEF_MAQUINAS, se adjunta la lista para que los
+		// dashboards filtren por code EXACTO; si no, filtran por prefijo.
+		dash := esync
+		if len(defMaquinas) > 0 {
+			dash.DefMaquinas = defMaquinas
+		}
+		dashData, _ := json.Marshal(dash)
+		nc.Publish(topicDashboard, dashData)
+
+		log.Printf("[emitter] Publicado (sync, full, %d sub-máquinas, %s y %s)", len(sedes), topicEmitterSync, topicDashboard)
 	}
 
-	// Cuando cambia una máquina, programamos publicación con debounce.
-	ms.SetOnChange(func(machineCode string) {
+	// Cuando cambia el estado, programamos publicación con debounce.
+	ms.SetOnChange(func() {
 		debounceMu.Lock()
-		if timer, ok := debounceTimers[machineCode]; ok {
-			timer.Stop()
+		if debounceTimer != nil {
+			debounceTimer.Stop()
 		}
-		debounceTimers[machineCode] = time.AfterFunc(debounceDelay, func() {
-			publicarParaMaquina(machineCode)
-		})
+		debounceTimer = time.AfterFunc(debounceDelay, publicar)
 		debounceMu.Unlock()
 	})
 
-	// --- Suscripciones ---
-	nc.Subscribe(subjAsignar, func(m *nats.Msg) {
+	// parseAsignacion decodifica un mensaje de asignación y verifica que sea
+	// de MI GRUPO. Conserva el machine_code original (la sub-máquina) para
+	// poder fusionar y saber en qué sub-máquinas está cada persona.
+	parseAsignacion := func(data []byte) (model.MensajeAsignacion, bool) {
 		var msg model.MensajeAsignacion
-		if json.Unmarshal(m.Data, &msg) != nil || msg.MachineCode == "" {
-			return
+		if json.Unmarshal(data, &msg) != nil || msg.MachineCode == "" || !pertenece(msg.MachineCode) {
+			return msg, false
 		}
-		ms.Asignar(msg)
+		recordarSede(msg.MachineCode) // recordar esta sub-máquina para el fan-out
+		return msg, true
+	}
+
+	// leerEvento decodifica un evento de login/logout del lector.
+	leerEvento := func(data []byte) (model.EventoRFID, bool) {
+		var ev model.EventoRFID
+		if json.Unmarshal(data, &ev) != nil {
+			return ev, false
+		}
+		return ev, true
+	}
+
+	// publicarEvento publica un aviso (denied/cleared) con el puerto y tag.
+	publicarEvento := func(subject string, ev model.EventoRFID) {
+		data := fmt.Sprintf(`{"usb_port":"%s","tag":"%s"}`, ev.UsbPort, ev.Tag)
+		nc.Publish(subject, []byte(data))
+		log.Printf("[emitter] Publicado en %s: %s", subject, data)
+	}
+
+	// --- Suscripciones (solo procesa mensajes de MI GRUPO) ---
+	// El machine_code del mensaje es la sub-máquina (a2i-1-r, a2i-2-r, ...).
+	nc.Subscribe(subjAsignar, func(m *nats.Msg) {
+		if msg, ok := parseAsignacion(m.Data); ok {
+			ms.Asignar(msg.MachineCode, msg)
+		}
 	})
 
 	nc.Subscribe(subjForced, func(m *nats.Msg) {
-		var msg model.MensajeAsignacion
-		if json.Unmarshal(m.Data, &msg) != nil || msg.MachineCode == "" {
-			return
+		if msg, ok := parseAsignacion(m.Data); ok {
+			ms.AsignarForzado(msg.MachineCode, msg)
 		}
-		ms.AsignarForzado(msg)
 	})
 
 	nc.Subscribe(subjDesaignar, func(m *nats.Msg) {
-		var msg model.MensajeAsignacion
-		if json.Unmarshal(m.Data, &msg) != nil || msg.MachineCode == "" {
-			return
+		if msg, ok := parseAsignacion(m.Data); ok {
+			ms.Desasignar(msg.MachineCode) // quita esa sub-máquina de todos
 		}
-		ms.Desasignar(msg.MachineCode)
 	})
 
 	nc.Subscribe(subjLogin, func(m *nats.Msg) {
-		var ev model.EventoRFID
-		if json.Unmarshal(m.Data, &ev) != nil {
-			return
-		}
-		_, esValido := ms.RegistrarPorID(ev.Tag, ev.UsbPort)
-		if !esValido {
-			deniedData := fmt.Sprintf(`{"usb_port":"%s","tag":"%s"}`, ev.UsbPort, ev.Tag)
-			nc.Publish(topicDenied, []byte(deniedData))
-			log.Printf("[emitter] Publicado en %s: %s", topicDenied, deniedData)
+		if ev, ok := leerEvento(m.Data); ok && !ms.RegistrarPorID(ev.Tag, ev.UsbPort) {
+			publicarEvento(topicDenied, ev)
 		}
 	})
 
 	nc.Subscribe(subjLogout, func(m *nats.Msg) {
-		var ev model.EventoRFID
-		if json.Unmarshal(m.Data, &ev) != nil {
-			return
-		}
-		_, cambiado := ms.RetirarPorID(ev.Tag)
-		if !cambiado {
-			clearedData := fmt.Sprintf(`{"usb_port":"%s","tag":"%s"}`, ev.UsbPort, ev.Tag)
-			nc.Publish(topicCleared, []byte(clearedData))
-			log.Printf("[emitter] Publicado en %s: %s", topicCleared, clearedData)
+		if ev, ok := leerEvento(m.Data); ok && !ms.RetirarPorID(ev.Tag) {
+			publicarEvento(topicCleared, ev)
 		}
 	})
 
@@ -166,4 +261,23 @@ func getenv(clave, def string) string {
 		return v
 	}
 	return def
+}
+
+// leerDefMaquinas lee la variable DEF_MAQUINAS del .env (opcional) y devuelve
+// la lista de machine_codes. Si no está definida, devuelve nil (modo prefijo).
+// Formato del .env: DEF_MAQUINAS=a2i-1-r,a2i-2-r,a2i-3-r
+func leerDefMaquinas() []string {
+	raw := os.Getenv("DEF_MAQUINAS")
+	if raw == "" {
+		return nil
+	}
+	partes := strings.Split(raw, ",")
+	grupo := make([]string, 0, len(partes))
+	for _, p := range partes {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			grupo = append(grupo, p)
+		}
+	}
+	return grupo
 }
