@@ -90,14 +90,38 @@ func main() {
 	}
 
 	// Sedes vistas: sub-máquinas de las que hemos recibido asignaciones.
-	// Se usan para el fan-out por sub-máquina cuando no hay GRUPO explícito.
+	// Se usan para el fan-out por sub-máquina cuando no hay DEF_MAQUINAS.
+	// maxSedes acota el mapa: sin límite, un machine_code mal formado lo haría
+	// crecer para siempre y multiplicaría los publishes en cada evento.
+	const maxSedes = 64
 	var sedesMu sync.Mutex
 	sedesVistas := make(map[string]bool)
+	sedesPorRetirar := make(map[string]bool) // desasignadas: se quitan tras publicar
+
 	recordarSede := func(code string) {
 		sedesMu.Lock()
+		defer sedesMu.Unlock()
+		delete(sedesPorRetirar, code) // volvió a usarse
+		if sedesVistas[code] {
+			return
+		}
+		if len(sedesVistas) >= maxSedes {
+			log.Printf("[emitter] Límite de %d sub-máquinas alcanzado, se ignora %q", maxSedes, code)
+			return
+		}
 		sedesVistas[code] = true
+	}
+
+	// marcarSedeRetirada agenda el borrado de una sub-máquina desasignada.
+	// Se borra DESPUÉS de publicar, para que reciba el último estado (vacío).
+	marcarSedeRetirada := func(code string) {
+		sedesMu.Lock()
+		if sedesVistas[code] {
+			sedesPorRetirar[code] = true
+		}
 		sedesMu.Unlock()
 	}
+
 	// destinosFanout devuelve los codes a los que se publica papid.emitter.<code>.
 	destinosFanout := func() []string {
 		if len(defMaquinas) > 0 {
@@ -113,6 +137,18 @@ func main() {
 		return out
 	}
 
+	// purgarSedesRetiradas quita del fan-out las sub-máquinas desasignadas
+	// (ya recibieron su último mensaje con el estado vacío).
+	purgarSedesRetiradas := func() {
+		sedesMu.Lock()
+		for c := range sedesPorRetirar {
+			delete(sedesVistas, c)
+			delete(sedesPorRetirar, c)
+			log.Printf("[emitter] Sub-máquina %q retirada del fan-out", c)
+		}
+		sedesMu.Unlock()
+	}
+
 	// Conexión a NATS.
 	nc := conectar()
 	defer nc.Drain()
@@ -120,10 +156,21 @@ func main() {
 	// Store de la máquina física (una sola, la del emitter).
 	ms := multistore.New(machineCode)
 
-	// Evita publicar múltiples veces en ráfaga cuando llegan varios eventos.
+	// Ventana para agrupar ráfagas de eventos en una sola publicación.
 	const debounceDelay = 200 * time.Millisecond //AQUI ESTA EL DELAY, pueden ser Millisecond o Second
-	var debounceMu sync.Mutex
-	var debounceTimer *time.Timer
+
+	// pub publica y registra el error (antes se descartaba: si el buffer de
+	// reconexión se desbordaba, se perdía estado en silencio).
+	pub := func(subject string, v any) {
+		data, err := json.Marshal(v)
+		if err != nil {
+			log.Printf("[emitter] Error serializando para %s: %v", subject, err)
+			return
+		}
+		if err := nc.Publish(subject, data); err != nil {
+			log.Printf("[emitter] Error publicando en %s: %v", subject, err)
+		}
+	}
 
 	publicar := func() {
 		// Unión del personal (sin el campo maquinas).
@@ -134,21 +181,17 @@ func main() {
 		sedes := destinosFanout()
 		for _, gc := range sedes {
 			base.MachineCode = gc
-			data, _ := json.Marshal(base)
-			nc.Publish(topicEmitterPrefix+gc, data)
+			pub(topicEmitterPrefix+gc, base)
 		}
 
 		// papid.personalui.sync / full (node-red) con machine_code = MACHINE_CODE.
 		base.MachineCode = machineCode
-		syncData, _ := json.Marshal(base)
-		nc.Publish(topicSync, syncData)
-		fullData, _ := json.Marshal(ms.BuildFull())
-		nc.Publish(topicFull, fullData)
+		pub(topicSync, base)
+		pub(topicFull, ms.BuildFull())
 
 		// papid.emitter.sync (compañero): objeto único con unión + maquinas.
 		esync := ms.BuildEmitterSync()
-		emitterSyncData, _ := json.Marshal(esync)
-		nc.Publish(topicEmitterSync, emitterSyncData)
+		pub(topicEmitterSync, esync)
 
 		// papid.emitter.dashboard (dashboards): mismo objeto con machine_code =
 		// MACHINE_CODE. Si hay DEF_MAQUINAS, se adjunta la lista para que los
@@ -157,21 +200,40 @@ func main() {
 		if len(defMaquinas) > 0 {
 			dash.DefMaquinas = defMaquinas
 		}
-		dashData, _ := json.Marshal(dash)
-		nc.Publish(topicDashboard, dashData)
+		pub(topicDashboard, dash)
+
+		// Las sub-máquinas desasignadas ya recibieron su estado final: fuera.
+		purgarSedesRetiradas()
 
 		log.Printf("[emitter] Publicado (sync, full, %d sub-máquinas, %s y %s)", len(sedes), topicEmitterSync, topicDashboard)
 	}
 
-	// Cuando cambia el estado, programamos publicación con debounce.
+	// Señal de "hay cambios por publicar". Capacidad 1 = las ráfagas se
+	// colapsan en una sola señal.
+	cambios := make(chan struct{}, 1)
 	ms.SetOnChange(func() {
-		debounceMu.Lock()
-		if debounceTimer != nil {
-			debounceTimer.Stop()
+		select {
+		case cambios <- struct{}{}:
+		default: // ya hay una publicación pendiente, se agrupa con esta
 		}
-		debounceTimer = time.AfterFunc(debounceDelay, publicar)
-		debounceMu.Unlock()
 	})
+
+	// Worker ÚNICO: garantiza que nunca haya dos publicar() en paralelo (con
+	// timers concurrentes dos snapshots podían publicarse en orden invertido y
+	// dejar a los dashboards con el estado viejo).
+	go func() {
+		for range cambios {
+			time.Sleep(debounceDelay) // agrupa la ráfaga
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[emitter] Panic al publicar (recuperado): %v", r)
+					}
+				}()
+				publicar()
+			}()
+		}
+	}()
 
 	// parseAsignacion decodifica un mensaje de asignación y verifica que sea
 	// de MI GRUPO. Conserva el machine_code original (la sub-máquina) para
@@ -201,33 +263,43 @@ func main() {
 		log.Printf("[emitter] Publicado en %s: %s", subject, data)
 	}
 
+	// suscribir registra un handler y aborta el arranque si falla (antes el
+	// error se ignoraba y el emitter quedaba ciego a ese subject en silencio).
+	suscribir := func(subject string, h nats.MsgHandler) {
+		if _, err := nc.Subscribe(subject, h); err != nil {
+			log.Fatalf("[emitter] No se pudo suscribir a %s: %v", subject, err)
+		}
+		log.Printf("[emitter] Suscrito a %s", subject)
+	}
+
 	// --- Suscripciones (solo procesa mensajes de MI GRUPO) ---
 	// El machine_code del mensaje es la sub-máquina (a2i-1-r, a2i-2-r, ...).
-	nc.Subscribe(subjAsignar, func(m *nats.Msg) {
+	suscribir(subjAsignar, func(m *nats.Msg) {
 		if msg, ok := parseAsignacion(m.Data); ok {
 			ms.Asignar(msg.MachineCode, msg)
 		}
 	})
 
-	nc.Subscribe(subjForced, func(m *nats.Msg) {
+	suscribir(subjForced, func(m *nats.Msg) {
 		if msg, ok := parseAsignacion(m.Data); ok {
 			ms.AsignarForzado(msg.MachineCode, msg)
 		}
 	})
 
-	nc.Subscribe(subjDesaignar, func(m *nats.Msg) {
+	suscribir(subjDesaignar, func(m *nats.Msg) {
 		if msg, ok := parseAsignacion(m.Data); ok {
 			ms.Desasignar(msg.MachineCode) // quita esa sub-máquina de todos
+			marcarSedeRetirada(msg.MachineCode)
 		}
 	})
 
-	nc.Subscribe(subjLogin, func(m *nats.Msg) {
+	suscribir(subjLogin, func(m *nats.Msg) {
 		if ev, ok := leerEvento(m.Data); ok && !ms.RegistrarPorID(ev.Tag, ev.UsbPort) {
 			publicarEvento(topicDenied, ev)
 		}
 	})
 
-	nc.Subscribe(subjLogout, func(m *nats.Msg) {
+	suscribir(subjLogout, func(m *nats.Msg) {
 		if ev, ok := leerEvento(m.Data); ok && !ms.RetirarPorID(ev.Tag) {
 			publicarEvento(topicCleared, ev)
 		}
@@ -241,10 +313,48 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	log.Println("[emitter] Apagando...")
+
+	// Publica el último estado pendiente y espera a que salga de verdad.
+	select {
+	case <-cambios:
+		publicar()
+	default:
+	}
+	if err := nc.FlushTimeout(5 * time.Second); err != nil {
+		log.Printf("[emitter] Flush incompleto al apagar: %v", err)
+	}
 }
 
 func conectar() *nats.Conn {
-	opts := []nats.Option{nats.Name("papid-emitter-multi")}
+	opts := []nats.Option{
+		nats.Name("papid-emitter-multi"),
+		// Servicio 24/7: reintentar INDEFINIDAMENTE. El emitter es la única
+		// fuente de verdad de los dashboards; con el default (60 intentos) una
+		// caída del broker lo dejaba como proceso zombi (vivo pero mudo).
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(2 * time.Second),
+		nats.ReconnectJitter(100*time.Millisecond, time.Second),
+		nats.Timeout(10 * time.Second),
+		nats.RetryOnFailedConnect(true),
+		// Buffer amplio para no perder publicaciones mientras reconecta.
+		nats.ReconnectBufSize(16 * 1024 * 1024),
+		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+			log.Printf("[emitter] NATS desconectado: %v (reintentando...)", err)
+		}),
+		nats.ReconnectHandler(func(c *nats.Conn) {
+			log.Printf("[emitter] NATS reconectado a %s", c.ConnectedUrl())
+		}),
+		nats.ClosedHandler(func(_ *nats.Conn) {
+			log.Println("[emitter] NATS: conexión cerrada definitivamente")
+		}),
+		nats.ErrorHandler(func(_ *nats.Conn, s *nats.Subscription, err error) {
+			subject := ""
+			if s != nil {
+				subject = s.Subject
+			}
+			log.Printf("[emitter] NATS error (subject %q): %v", subject, err)
+		}),
+	}
 	if u := os.Getenv("NATS_USER"); u != "" {
 		opts = append(opts, nats.UserInfo(u, os.Getenv("NATS_PASS")))
 	}

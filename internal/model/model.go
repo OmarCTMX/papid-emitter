@@ -71,5 +71,5 @@ type PersonaSync struct {
 	Status              string   `json:"status"`
 	TipoAsignacionID    int      `json:"tipo_asignacion_id"`
 	UsbPort             string   `json:"usb_port,omitempty"`
-	Maquinas            []string `json:"maquinas,omitempty"` // sub-máquinas donde está asignado (solo en papid.emitter.sync)
+	Maquinas            []string `json:"maquinas,omitempty"` // sub-máquinas donde está asignado
 }

@@ -51,11 +51,21 @@ func New(machineCode string) *Store {
 	return s
 }
 
-func (s *Store) SetOnChange(fn func()) { s.onChange = fn }
+// SetOnChange registra el callback de cambios (protegido con lock: antes se
+// escribía y leía sin sincronizar, lo que era un race de datos).
+func (s *Store) SetOnChange(fn func()) {
+	s.mu.Lock()
+	s.onChange = fn
+	s.mu.Unlock()
+}
 
+// notificar dispara el callback. Se llama SIEMPRE con el lock liberado.
 func (s *Store) notificar() {
-	if s.onChange != nil {
-		s.onChange()
+	s.mu.RLock()
+	fn := s.onChange
+	s.mu.RUnlock()
+	if fn != nil {
+		fn()
 	}
 }
 
@@ -249,6 +259,8 @@ func (s *Store) BuildFull() model.MensajeFull {
 }
 
 // personnel construye la lista de personal (omitiendo los espacios vacíos).
+// Si conMaquinas es true se agrega el campo "maquinas", que solo viaja en
+// papid.emitter.sync y papid.emitter.dashboard.
 // Debe llamarse con el lock tomado.
 func (s *Store) personnel(conMaquinas bool) []model.PersonaSync {
 	out := make([]model.PersonaSync, 0, model.TotalSlots)
